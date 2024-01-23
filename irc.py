@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+import asyncio
+from tcp import Servidor
+import re
+apelidos_canais_conexoes = {}
+
+def validar_nome(nome):
+    return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
+
+def sair(conexao):
+    print(conexao, 'conexão fechada')
+    for canal in conexao.canais:
+        del canal.conexoes[conexao.apelido.lower()]
+
+        for apelido, membro_conexao in canal.conexoes.items():
+            membro_conexao.enviar(
+                b':' + conexao.apelido + b' QUIT :Connection closed' + b'\r\n')
+    if conexao.apelido != b'*':
+        del apelidos_canais_conexoes[conexao.apelido.lower()]
+    conexao.fechar()
+
+def dados_recebidos(conexao, dados):
+    conexao.dados_residuais = conexao.dados_residuais + dados
+    while b'\r\n' in conexao.dados_residuais:
+        dados, quebra, conexao.dados_residuais = conexao.dados_residuais.partition(
+            b'\r\n')
+        dados = dados + quebra
+        comando = dados.split(b' ', 1)[0]
+        if comando == b'':
+            return sair(conexao)
+        elif comando == b'PING':
+            ping(conexao, dados)
+        elif comando == b'NICK':
+            nick(conexao, dados)
+        elif comando == b'PRIVMSG':
+            privatemsg(conexao, dados)
+        elif comando == b'JOIN':
+            join(conexao, dados)
+        elif comando == b'PART':
+            part(conexao, dados)
+    comando = dados.split(b' ', 1)[0]
+    if comando == b'':
+        return sair(conexao)
+    print(conexao, dados)
+
+def conexao_aceita(conexao):
+    print(conexao, 'nova conexão')
+    conexao.registrar_recebedor(dados_recebidos)
+    conexao.dados_residuais = b''
+    conexao.apelido = b'*'
+    conexao.canais = []
+
+def ping(conexao, dados):
+    conexao.enviar(b':server PONG server :' + dados.split(b' ', 1)[1])
+
+def nick(conexao, dados):
+    apelido = dados.split(b' ', 1)[1]
+    apelido = apelido.split(b'\r\n')[0]
+    if apelido.lower() in apelidos_canais_conexoes:
+        conexao.enviar(b':server 433 ' + conexao.apelido + b' ' +
+                       apelido + b' :Nickname is already in use' + b'\r\n')
+        return
+    if validar_nome(apelido):
+        if (conexao.apelido != b'*'):
+            apelido_antigo = conexao.apelido.lower()
+            del apelidos_canais_conexoes[conexao.apelido.lower()]
+            apelidos_canais_conexoes[apelido.lower()] = conexao
+            for canal in conexao.canais:
+                canal.troca_apelido_membro(conexao, apelido)
+
+            conexao.apelido = apelido
+            conexao.enviar(b':' + apelido_antigo +
+                           b' NICK ' + apelido + b'\r\n')
+        else:
+            apelidos_canais_conexoes[apelido.lower()] = conexao
+            conexao.apelido = apelido
+            conexao.enviar(b':server 001 ' + apelido + b' :Welcome' + b'\r\n')
+            conexao.enviar(b':server 422 ' + apelido +
+                           b' :MOTD File is missing' + b'\r\n')
+    else:
+        conexao.enviar(b':server 432 ' + conexao.apelido +
+                       b' ' + apelido + b' :Erroneous nickname' + b'\r\n')
+
+def privatemsg(conexao, dados):
+    destinatario = dados.strip(b'\r\n').split(b' ')[1]
+    mensagem = dados.strip(b'\r\n').split(b' ')[2]
+    mensagem = mensagem[1:]
+    if destinatario.lower() not in apelidos_canais_conexoes:
+        return
+    print(b':' + conexao.apelido + b' PRIVMSG ' +
+          destinatario + b' :' + mensagem + b'\r\n')
+    apelidos_canais_conexoes[destinatario.lower()].enviar(b':' + conexao.apelido + b' PRIVMSG ' +
+                                                          destinatario + b' :' + mensagem + b'\r\n')
+
+def join(conexao, dados):
+    nome_canal = dados.strip(b'\r\n').split(b' ', 1)[1]
+    if nome_canal[0] != b'#' and not validar_nome(nome_canal[1:]):
+        conexao.enviar(b':server 403 ' + nome_canal + b' :No such channel')
+        return
+    if nome_canal.lower() not in apelidos_canais_conexoes:
+        canal = Canal(nome_canal)
+        apelidos_canais_conexoes[nome_canal.lower()] = canal
+    else:
+        canal = apelidos_canais_conexoes[nome_canal.lower()]
+    conexao.canais.append(canal)
+    canal.nova_conexao(conexao)
+
+def part(conexao, dados):
+    nome_canal = dados.strip(b'\r\n').split(b' ', 1)[1]
+    if nome_canal.find(b' ') != -1:
+        nome_canal, _ = nome_canal.split(b' ', 1)
+
+    if nome_canal.lower() not in apelidos_canais_conexoes:
+        canal = Canal(nome_canal)
+        apelidos_canais_conexoes[nome_canal.lower()] = canal
+    else:
+        canal = apelidos_canais_conexoes[nome_canal.lower()]
+
+    conexao.canais.remove(canal)
+    canal.part_membro(conexao)
+
+class Canal:
+    def __init__(self, nome):
+        self.nome = nome
+        self.conexoes = {}
+
+    def nova_conexao(self, conexao):
+        self.conexoes[conexao.apelido.lower()] = conexao
+        for apelido, conexao_membro in self.conexoes.items():
+            conexao_membro.enviar(
+                b':' + conexao.apelido + b' JOIN :' + self.nome + b'\r\n')
+
+        mensagem = b':server 353 ' + conexao.apelido + b' = ' + self.nome + b' :'
+        mensagem += list(self.conexoes)[0]
+        for membro in list(self.conexoes)[1:]:
+            if len(mensagem + membro + b' ' + b'\r\n') < 512:
+                mensagem += b' ' + membro
+            else:
+                conexao.enviar(mensagem + b'\r\n')
+                mensagem = b':server 353 ' + conexao.apelido + \
+                    b' = ' + self.nome + b' :' + b' ' + membro
+
+        conexao.enviar(mensagem + b'\r\n')
+        conexao.enviar(b':server 366 ' + conexao.apelido +
+                       b' ' + self.nome + b' :End of /NAMES list.' + b'\r\n')
+
+    def part_membro(self, conexao):
+        for apelido, conexao_membro in self.conexoes.items():
+            conexao_membro.enviar(
+                b':' + conexao.apelido + b' PART ' + self.nome + b'\r\n')
+
+        del self.conexoes[conexao.apelido.lower()]
+
+    def troca_apelido_membro(self, conexao, novo):
+        del self.conexoes[conexao.apelido.lower()]
+        self.conexoes[novo.lower()] = conexao
+
+    def enviar(self, mensagem):
+        remetente, _ = mensagem.split(b' ', 1)
+        remetente = remetente[1:]
+        for apelido, conexao_membro in self.conexoes.items():
+            if apelido != remetente:
+                conexao_membro.enviar(mensagem)
+
+servidor = Servidor(6667)
+servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
+asyncio.get_event_loop().run_forever()
